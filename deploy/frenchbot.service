@@ -1,0 +1,18 @@
+[Unit]
+Description=TikTok -> Discord live alert bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adapte ces deux chemins à ton install sur le serveur Debian
+WorkingDirectory=/root/FrenchBot
+ExecStart=/root/.nvm/versions/node/v22.23.1/bin/node bot.js
+Restart=always
+RestartSec=5
+User=root
+EnvironmentFile=/root/FrenchBot/.env
+
+[Install]
+WantedBy=multi-user.target
+

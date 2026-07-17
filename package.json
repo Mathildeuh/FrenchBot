@@ -1,0 +1,15 @@
+{
+  "name": "tiktok-discord-live-bot",
+  "version": "1.0.0",
+  "description": "Bot Discord qui alerte quand un compte TikTok passe en live",
+  "main": "bot.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "tiktok-live-connector": "^2.4.2"
+  }
+}
