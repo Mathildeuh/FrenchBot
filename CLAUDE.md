@@ -21,6 +21,7 @@ Runtime config comes entirely from a `.env` file (see `env.example` for the temp
 - `CHANNEL_ID` — Discord channel to post alerts into
 - `TIKTOK_USERNAME` — TikTok handle to watch (no `@`)
 - `EULER_API_KEY` — Euler Stream API key, required by `tiktok-live-connector` to sign TikTok requests
+- `GUILD_ID` — optional; if set, the `/prochain-stream` slash command is registered to that guild (instant propagation) instead of globally (up to 1h the first time)
 
 The bot exits at startup (`process.exit(1)`) if `DISCORD_TOKEN`, `CHANNEL_ID`, or `TIKTOK_USERNAME` are missing.
 
@@ -46,6 +47,14 @@ When changing polling/alerting behavior, the false→true edge detection in `che
 - `roomInfo.owner.avatar_thumb.url_list[0]` — streamer's avatar
 
 There's no local TypeScript types for `RoomInfo` (it's `Record<string, any>`); the authoritative shape is `WebcastFeedResponseRoomData` in `node_modules/tiktok-live-api-sdk/dist/index.d.ts`.
+
+### Next-stream schedule & DM/slash interactions
+
+- `SCHEDULE_ADMIN_IDS` (hardcoded array of two Discord user IDs) are the only users who can set the next stream date/time. Everyone else is read-only.
+- `/prochain-stream`: admins get a modal (`ModalBuilder` with two free-text `TextInputBuilder` fields, date and heure — Discord modals have no native date picker) that writes to `prochain-stream.json` via `saveNextStream()`. Non-admins just get the current value read back via `formatNextStreamText()`.
+- `prochain-stream.json` (gitignored, lives next to `bot.js`) is the only persisted state in the bot — `{ date, heure }` as free-form strings, deliberately not parsed into a `Date` to avoid timezone bugs. It survives restarts; `loadNextStream()` returns `null` if the file doesn't exist yet.
+- DM auto-reply: any non-bot message received in a DM channel (`message.guild` is falsy) triggers a reply combining `formatNextStreamText()` and `formatLiveStatusText()` (the latter reads the same `isCurrentlyLive` flag used for the live-alert edge detection). Message content is intentionally never inspected — the reply is the same regardless of what was sent.
+- Requires the `GatewayIntentBits.DirectMessages` intent and `Partials.Channel` (so DMs on an uncached channel still fire `messageCreate` after a restart).
 
 ## Deployment (Debian)
 
