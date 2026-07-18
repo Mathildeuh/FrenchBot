@@ -46,7 +46,12 @@ if (!DISCORD_TOKEN || !CHANNEL_ID || !TIKTOK_USERNAME) {
 }
 
 const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages, // requis pour recevoir messageCreate sur les salons (ex: le salon de comptage)
+    GatewayIntentBits.MessageContent, // requis pour lire le contenu des messages de salon (privilégié, à activer aussi sur le portail développeur)
+    GatewayIntentBits.DirectMessages,
+  ],
   partials: [Partials.Channel], // requis pour recevoir les messages DM sur un canal pas encore en cache
 });
 
@@ -177,12 +182,15 @@ async function handleCountingMessage(message) {
   const expected = current + 1;
   const isRightNumber = /^\d+$/.test(content) && Number(content) === expected;
 
+  console.log(`🔢 Message reçu dans le salon de comptage de ${message.author.tag} : "${content}" (attendu : ${expected})`);
+
   try {
     if (isRightNumber) {
       const lastCount = lastCountByUser.get(message.author.id) || 0;
       const remainingMs = COUNTING_COOLDOWN_MS - (Date.now() - lastCount);
 
       if (remainingMs > 0) {
+        console.log(`⏳ ${message.author.tag} est en cooldown (${Math.ceil(remainingMs / 60_000)} min restantes), reset du compte.`);
         saveCounting(0);
         await message.channel.send({
           embeds: [
@@ -199,9 +207,11 @@ async function handleCountingMessage(message) {
       saveCounting(expected);
       lastCountByUser.set(message.author.id, Date.now());
       await message.react('✅');
+      console.log(`✅ Bon compte : ${expected}.`);
       return;
     }
 
+    console.log(`❌ Mauvais compte de ${message.author.tag}, reset à 0.`);
     saveCounting(0);
     await message.channel.send({
       embeds: [
