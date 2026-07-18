@@ -119,6 +119,22 @@ function saveStreamsPlanning(weekly, dates) {
   fs.writeFileSync(STREAMS_FILE, JSON.stringify({ weekly, dates }, null, 2));
 }
 
+// Fichier où sont persistés les meilleurs scores connus (un par statistique de live), pour
+// détecter les nouveaux records d'un live à l'autre. Survit aux redémarrages du bot.
+const RECORDS_FILE = path.join(__dirname, 'records.json');
+
+function loadRecords() {
+  try {
+    return JSON.parse(fs.readFileSync(RECORDS_FILE, 'utf8'));
+  } catch (err) {
+    return {}; // pas encore de record enregistré : tout compte comme un premier record
+  }
+}
+
+function saveRecords(records) {
+  fs.writeFileSync(RECORDS_FILE, JSON.stringify(records, null, 2));
+}
+
 function buildStreamsEmbed() {
   const { weekly, dates } = loadStreamsPlanning();
   const now = Math.floor(Date.now() / 1000);
@@ -317,28 +333,65 @@ function attachLiveListeners(connection) {
   });
 }
 
+// Compare les stats du live qui vient de se terminer aux meilleurs scores connus (records.json),
+// met à jour le fichier pour chaque nouveau record, et renvoie l'ensemble des clés battues.
+function checkAndUpdateRecords(stats, durationMs) {
+  const records = loadRecords();
+  const candidates = {
+    durationMs,
+    viewerMax: stats.viewerMax,
+    totalGifts: stats.totalGifts,
+    totalDiamonds: stats.totalDiamonds,
+    likeTotal: stats.likeTotal,
+    followCount: stats.followCount,
+    shareCount: stats.shareCount,
+  };
+
+  const broken = new Set();
+  for (const [key, value] of Object.entries(candidates)) {
+    if (value > (records[key] || 0)) {
+      records[key] = value;
+      broken.add(key);
+    }
+  }
+
+  if (broken.size) saveRecords(records);
+  return broken;
+}
+
 // Envoie le récap du live (durée, cadeaux/pièces, likes, follows, partages, viewers, questions
-// fréquentes) en DM aux admins définis dans SCHEDULE_ADMIN_IDS.
+// fréquentes) en DM aux admins définis dans SCHEDULE_ADMIN_IDS. Les statistiques qui battent un
+// record précédent (voir checkAndUpdateRecords) sont signalées directement dans le champ concerné.
 async function sendLiveRecapDM(stats) {
-  const durationText = formatDuration(Date.now() - stats.startedAt);
+  const durationMs = Date.now() - stats.startedAt;
+  const durationText = formatDuration(durationMs);
   const viewerAvg = stats.viewerSampleCount
     ? Math.round(stats.viewerSampleSum / stats.viewerSampleCount)
     : stats.viewerMax;
 
   const topQuestions = [...stats.questionCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
 
+  const brokenRecords = checkAndUpdateRecords(stats, durationMs);
+  const withRecordFlag = (key, text) => (brokenRecords.has(key) ? `${text} 🆕 record !` : text);
+
   const embed = new EmbedBuilder()
     .setColor(0xFE2C55)
-    .setTitle(`📊 Récap du live de ${TIKTOK_USERNAME}`)
+    .setTitle(`📊 Récap du live de ${TIKTOK_USERNAME}`);
+
+  if (brokenRecords.size > 0) {
+    embed.setDescription(`🎉 ${brokenRecords.size} nouveau${brokenRecords.size > 1 ? 'x' : ''} record${brokenRecords.size > 1 ? 's' : ''} sur ce live !`);
+  }
+
+  embed
     .addFields(
-      { name: '⏱️ Durée', value: durationText, inline: true },
-      { name: '👀 Viewers max', value: stats.viewerMax.toLocaleString('fr-FR'), inline: true },
+      { name: '⏱️ Durée', value: withRecordFlag('durationMs', durationText), inline: true },
+      { name: '👀 Viewers max', value: withRecordFlag('viewerMax', stats.viewerMax.toLocaleString('fr-FR')), inline: true },
       { name: '👀 Viewers moyen', value: viewerAvg.toLocaleString('fr-FR'), inline: true },
-      { name: '🎁 Cadeaux reçus', value: stats.totalGifts.toLocaleString('fr-FR'), inline: true },
-      { name: '💎 Pièces gagnées', value: stats.totalDiamonds.toLocaleString('fr-FR'), inline: true },
-      { name: '❤️ Likes', value: stats.likeTotal.toLocaleString('fr-FR'), inline: true },
-      { name: '➕ Nouveaux abonnés', value: stats.followCount.toLocaleString('fr-FR'), inline: true },
-      { name: '🔁 Partages', value: stats.shareCount.toLocaleString('fr-FR'), inline: true },
+      { name: '🎁 Cadeaux reçus', value: withRecordFlag('totalGifts', stats.totalGifts.toLocaleString('fr-FR')), inline: true },
+      { name: '💎 Pièces gagnées', value: withRecordFlag('totalDiamonds', stats.totalDiamonds.toLocaleString('fr-FR')), inline: true },
+      { name: '❤️ Likes', value: withRecordFlag('likeTotal', stats.likeTotal.toLocaleString('fr-FR')), inline: true },
+      { name: '➕ Nouveaux abonnés', value: withRecordFlag('followCount', stats.followCount.toLocaleString('fr-FR')), inline: true },
+      { name: '🔁 Partages', value: withRecordFlag('shareCount', stats.shareCount.toLocaleString('fr-FR')), inline: true },
       {
         name: '❓ Questions les plus posées',
         value: topQuestions.length
