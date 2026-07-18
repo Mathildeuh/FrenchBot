@@ -29,6 +29,11 @@ const GUILD_ID = process.env.GUILD_ID;
 // Tout le monde d'autre ne fait que consulter la date déjà annoncée.
 const SCHEDULE_ADMIN_IDS = ['1417205528429334568', '1527356296012238979'];
 
+// Salon dédié au jeu du comptage : chaque message doit être le nombre suivant celui d'avant.
+// Une erreur (mauvais nombre, message non numérique) remet le compte à 0.
+const COUNTING_CHANNEL_ID = '1528164616042057830';
+const COUNTING_TOPIC = '🔢 Comptez le plus loin possible ! Un message = un chiffre, celui juste après le précédent. Une erreur ? Le compte repart de 0.';
+
 // Intervalle entre chaque vérification (en ms). 60000 = 1 minute.
 // Ne descends pas trop bas pour éviter de te faire rate-limiter.
 const CHECK_INTERVAL = 60_000;
@@ -116,6 +121,79 @@ function loadStreamsPlanning() {
 
 function saveStreamsPlanning(weekly, dates) {
   fs.writeFileSync(STREAMS_FILE, JSON.stringify({ weekly, dates }, null, 2));
+}
+
+// Fichier où est persisté le compte en cours du salon de comptage (survit aux redémarrages).
+const COUNTING_FILE = path.join(__dirname, 'compteur.json');
+
+function loadCounting() {
+  try {
+    return JSON.parse(fs.readFileSync(COUNTING_FILE, 'utf8')).count || 0;
+  } catch (err) {
+    return 0; // pas encore de compte enregistré
+  }
+}
+
+function saveCounting(count) {
+  fs.writeFileSync(COUNTING_FILE, JSON.stringify({ count }, null, 2));
+}
+
+function buildCountingRulesEmbed({ authorId, brokenAt, expected, got }) {
+  return new EmbedBuilder()
+    .setColor(0xFF0000)
+    .setTitle('❌ Perdu ! Le compte repart de 0')
+    .setDescription(
+      `<@${authorId}> a cassé le compte à **${brokenAt}** (écrit \`${got}\` au lieu de \`${expected}\`).\n\n` +
+        '📜 **Règles du salon**\n' +
+        '• Un message = un chiffre.\n' +
+        '• Il doit être exactement le nombre précédent + 1.\n' +
+        '• Une erreur remet le compte à 0.\n\n' +
+        '➡️ Prochain nombre à écrire : **1**',
+    )
+    .setFooter({ text: 'Comptez le plus loin possible !' });
+}
+
+// Vérifie chaque message du salon de comptage : incrémente si c'est le bon nombre,
+// sinon remet le compte à 0 et explique pourquoi via un embed.
+async function handleCountingMessage(message) {
+  const content = message.content.trim();
+  const current = loadCounting();
+  const expected = current + 1;
+  const isCorrect = /^\d+$/.test(content) && Number(content) === expected;
+
+  try {
+    if (isCorrect) {
+      saveCounting(expected);
+      return;
+    }
+
+    saveCounting(0);
+    await message.channel.send({
+      embeds: [
+        buildCountingRulesEmbed({
+          authorId: message.author.id,
+          brokenAt: current,
+          expected,
+          got: (content || '*message vide*').replace(/`/g, "'").slice(0, 200),
+        }),
+      ],
+    });
+  } catch (err) {
+    console.error('❌ Erreur dans le salon de comptage :', err.message);
+  }
+}
+
+// Définit la description du salon de comptage une bonne fois pour toutes (idempotent,
+// pour ne pas cogner la limite de changements de topic de Discord à chaque redémarrage).
+async function ensureCountingChannelTopic() {
+  try {
+    const channel = await client.channels.fetch(COUNTING_CHANNEL_ID);
+    if (channel && channel.topic !== COUNTING_TOPIC) {
+      await channel.setTopic(COUNTING_TOPIC);
+    }
+  } catch (err) {
+    console.error('❌ Impossible de définir la description du salon de comptage :', err.message);
+  }
 }
 
 function buildStreamsEmbed() {
@@ -425,7 +503,14 @@ client.on('interactionCreate', async (interaction) => {
 // Réponse automatique en DM : peu importe ce qu'on écrit au bot, il donne la date
 // du prochain stream et si le live TikTok est en cours.
 client.on('messageCreate', async (message) => {
-  if (message.author.bot || message.guild) return;
+  if (message.author.bot) return;
+
+  if (message.guild) {
+    if (message.channel.id === COUNTING_CHANNEL_ID) {
+      await handleCountingMessage(message);
+    }
+    return;
+  }
 
   console.log(`📩 DM reçu de ${message.author.tag} (${message.author.id})`);
   try {
@@ -442,6 +527,7 @@ client.once('ready', async () => {
 
   await registerCommands();
   await updateChannelTopic(false); // état par défaut au démarrage : pas en live
+  await ensureCountingChannelTopic();
 
   checkTikTokLive(); // première vérif immédiate (corrigera le topic si elle est déjà en live)
   setInterval(checkTikTokLive, CHECK_INTERVAL);

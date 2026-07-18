@@ -58,6 +58,13 @@ There's no local TypeScript types for `RoomInfo` (it's `Record<string, any>`); t
 - DM auto-reply: any non-bot message received in a DM channel (`message.guild` is falsy) triggers a reply combining `formatNextStreamText()` and `formatLiveStatusText()` (the latter reads the same `isCurrentlyLive` flag used for the live-alert edge detection). Message content is intentionally never inspected — the reply is the same regardless of what was sent.
 - Requires the `GatewayIntentBits.DirectMessages` intent and `Partials.Channel` (so DMs on an uncached channel still fire `messageCreate` after a restart).
 
+### Counting channel (`compteur.json`)
+
+- `COUNTING_CHANNEL_ID` (hardcoded, same style as `SCHEDULE_ADMIN_IDS`) is the one channel where `handleCountingMessage()` runs on every non-bot message.
+- The rule: a message must be exactly the last successful count + 1 (checked via `/^\d+$/` then numeric equality — no leading text, decimals, or negative numbers). Correct messages just persist the new count to `compteur.json` (`{ count }`) with no bot reply. Any miss (wrong number or non-numeric content) resets `count` to `0` and posts an embed (`buildCountingRulesEmbed()`) naming who broke it, at what count, and restating the rules.
+- There's no "same person can't count twice in a row" rule — only the sequential-number check described above.
+- The channel topic (`COUNTING_TOPIC`) is set once at startup via `ensureCountingChannelTopic()`, which skips the API call if the topic already matches (Discord rate-limits topic edits to ~2/10min).
+
 ## Deployment (Debian)
 
 `deploy/frenchbot.service` is a systemd unit template for running the bot 24/7 with auto-restart on crash and on boot (`Restart=always`). To install on the target server: copy the repo, edit the `WorkingDirectory`/`User`/`EnvironmentFile` placeholders, then:
