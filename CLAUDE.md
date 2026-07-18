@@ -30,11 +30,25 @@ The bot exits at startup (`process.exit(1)`) if `DISCORD_TOKEN`, `CHANNEL_ID`, o
 Everything lives in `bot.js`. The core loop:
 
 1. On Discord client `ready`, `checkTikTokLive()` runs immediately, then again every `CHECK_INTERVAL` (60s, hardcoded).
-2. Each check opens a fresh `TikTokLiveConnection` and calls `.connect()`. Success means the account is live; a thrown error means it isn't (or the connection failed) — both are treated as "not live" in the `catch` block, and the connection is always torn down in `finally` since the bot only needs a point-in-time status, not a persistent chat connection.
-3. `isCurrentlyLive` is the only state the bot keeps. It gates notifications so a live session triggers exactly one Discord alert, no matter how many polling intervals it spans; the alert only fires on the false→true transition.
-4. `sendLiveAlert()` fetches the target channel and posts an embed (author/avatar, title, stream title, cover image, viewer count) plus an `@everyone` content string. Note: `allowedMentions: { parse: ['everyone'] }` is required or Discord silently suppresses the actual ping.
+2. While **not** live, each poll opens a fresh `TikTokLiveConnection` and calls `.connect()`. Success means the account just went live — the connection is deliberately **not** torn down (no `finally`/`disconnect()` on this path); it's kept open and handed to `attachLiveListeners()` to track the live in real time. A thrown error means still not live, and that throwaway connection is disconnected.
+3. While live, `checkTikTokLive()` no-ops (just refreshes the bot's presence from `liveStats.lastViewerCount`) — the persistent connection from step 2 owns detecting the end of the live via its own `WebcastEvent.STREAM_END`/`ControlEvent.DISCONNECTED` events (see `attachLiveListeners`), not the poller. As a fallback, the poller also checks `liveConnection.isConnected` each tick in case a disconnect never fired an event.
+4. `isCurrentlyLive` is the primary state flag; `liveConnection` (the open connection) and `liveStats` (accumulators for the recap, see below) are the other two pieces of live-session state, all three set together when a live starts and cleared together in `finalizeLiveEnd()`. `isCurrentlyLive` gates notifications so a live session triggers exactly one Discord alert, no matter how many polling intervals it spans; the alert only fires on the false→true transition.
+5. `sendLiveAlert()` fetches the target channel and posts an embed (author/avatar, title, stream title, cover image, viewer count) plus an `@everyone` content string. Note: `allowedMentions: { parse: ['everyone'] }` is required or Discord silently suppresses the actual ping.
 
-When changing polling/alerting behavior, the false→true edge detection in `checkTikTokLive` is the key invariant to preserve — don't let it re-fire on every interval while still live.
+When changing polling/alerting behavior, the false→true edge detection in `checkTikTokLive` is the key invariant to preserve — don't let it re-fire on every interval while still live. Likewise, don't reintroduce a `disconnect()` on the live-tracking connection path — that's what feeds `attachLiveListeners()`.
+
+### Bot presence & end-of-live recap
+
+- `updateBotPresence(isLive, viewerCount)` sets the bot's Discord activity to a `ActivityType.Custom` status (no "Playing/Watching" prefix) — `🔴 En live avec N viewers` or `⚪ Pas en live actuellement`. Called on every transition and, while live, refreshed each poll tick from `liveStats.lastViewerCount`.
+- `attachLiveListeners(connection)` is called once, right after a live is detected, and wires up `tiktok-live-connector`'s real-time `WebcastEvent`/`ControlEvent` handlers (imported from `tiktok-live-connector`'s main export, backed by `tiktok-live-proto/v3`'s raw protobuf message shapes — **not** the friendlier field names shown in that package's README, which only apply to its `/legacy` entry point) onto `liveStats`:
+  - `WebcastEvent.GIFT` → `gift.diamondCount` accumulates into `totalDiamonds`; combo gifts (`gift.type === 1`) only count once, on the event where `repeatEnd` is truthy, to avoid double-counting mid-streak events.
+  - `WebcastEvent.LIKE` → `msg.total` is already the live's cumulative like count, so `likeTotal` is overwritten (not summed) each event.
+  - `WebcastEvent.FOLLOW` / `WebcastEvent.SHARE` → both distinguished purely by which event name fired (both carry the same `WebcastSocialMessage` payload shape), each increments its own counter by 1.
+  - `WebcastEvent.ROOM_USER` → `msg.total` is the current viewer count; tracked into `viewerMax` and a running sum/count for the average.
+  - `WebcastEvent.CHAT` → messages containing `?` are bucketed by lowercased/whitespace-normalized text in `questionCounts`, a plain frequency count (no semantic grouping) used for the "most asked questions" recap field.
+  - `WebcastEvent.STREAM_END` and `ControlEvent.DISCONNECTED` both funnel into ending the live: `STREAM_END` finalizes immediately; a bare `DISCONNECTED` (which could be a transient drop) waits 5s and attempts one `connection.connect(connection.roomId)` reconnect before giving up and finalizing. `liveEndHandled` guards against both firing and finalizing twice (`STREAM_END` triggers a `DISCONNECTED` right after it per the library's docs).
+- `finalizeLiveEnd()` is the single exit point for "live is over" regardless of which path triggered it: resets `isCurrentlyLive`/`liveConnection`/`liveStats`, updates topic/presence, disconnects the connection, and calls `sendLiveRecapDM(stats)`.
+- `sendLiveRecapDM()` DMs an embed recap (duration, gifts, diamonds/"pièces", likes, follows, shares, viewer max/avg, top 5 questions) to every ID in `SCHEDULE_ADMIN_IDS` — the same admin list used for schedule editing, reused here as "who should get the live recap" rather than adding a separate config var.
 
 ### `state.roomInfo` field shapes
 
