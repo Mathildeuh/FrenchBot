@@ -54,8 +54,33 @@ function loadNextStream() {
   }
 }
 
-function saveNextStream(date, heure) {
-  fs.writeFileSync(SCHEDULE_FILE, JSON.stringify({ date, heure }, null, 2));
+function saveNextStream(timestamp) {
+  fs.writeFileSync(SCHEDULE_FILE, JSON.stringify({ timestamp }, null, 2));
+}
+
+// Renvoie le décalage (en minutes) entre UTC et l'heure de Paris au moment donné,
+// pour gérer automatiquement l'heure d'été/hiver sans dépendance externe.
+function parisOffsetMinutes(utcGuessMs) {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: 'Europe/Paris',
+    timeZoneName: 'shortOffset',
+  }).formatToParts(utcGuessMs);
+  const match = parts.find((p) => p.type === 'timeZoneName')?.value.match(/GMT([+-]\d+)/);
+  return match ? parseInt(match[1], 10) * 60 : 60;
+}
+
+// Convertit "JJ/MM/AAAA" + "HH:mm" (saisis en heure de Paris) en timestamp Unix (secondes).
+// Renvoie null si le format ou les valeurs sont invalides.
+function parseParisDateTime(input) {
+  const match = input.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2})[h:](\d{2})$/i);
+  if (!match) return null;
+
+  const [, day, month, year, hour, minute] = match.map(Number);
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) return null;
+
+  const utcGuess = Date.UTC(year, month - 1, day, hour, minute);
+  const realUtcMs = utcGuess - parisOffsetMinutes(utcGuess) * 60_000;
+  return Math.floor(realUtcMs / 1000);
 }
 
 // Le client Discord se reconnecte déjà tout seul en cas de coupure réseau ;
@@ -77,7 +102,9 @@ let isCurrentlyLive = false; // état mémorisé pour ne notifier qu'une seule f
 function formatNextStreamText() {
   const next = loadNextStream();
   if (!next) return "📅 Aucun prochain stream n'est annoncé pour le moment.";
-  return `📅 Prochain stream : **${next.date}** à **${next.heure}**`;
+  // <t:...:F> = date/heure complète, <t:...:R> = relatif ("dans 3 jours") ;
+  // Discord affiche les deux dans le fuseau horaire local de chaque personne qui lit le message.
+  return `📅 Prochain stream : <t:${next.timestamp}:F> (<t:${next.timestamp}:R>)`;
 }
 
 function formatLiveStatusText() {
@@ -201,22 +228,14 @@ client.on('interactionCreate', async (interaction) => {
           .setCustomId('prochain-stream-modal')
           .setTitle('Définir le prochain stream');
 
-        const dateInput = new TextInputBuilder()
-          .setCustomId('date')
-          .setLabel('Date (ex : Dimanche 20 juillet)')
+        const datetimeInput = new TextInputBuilder()
+          .setCustomId('datetime')
+          .setLabel('Date et heure (heure de Paris)')
+          .setPlaceholder('JJ/MM/AAAA HH:mm — ex : 20/07/2026 18:00')
           .setStyle(TextInputStyle.Short)
           .setRequired(true);
 
-        const heureInput = new TextInputBuilder()
-          .setCustomId('heure')
-          .setLabel('Heure (ex : 18h00)')
-          .setStyle(TextInputStyle.Short)
-          .setRequired(true);
-
-        modal.addComponents(
-          new ActionRowBuilder().addComponents(dateInput),
-          new ActionRowBuilder().addComponents(heureInput),
-        );
+        modal.addComponents(new ActionRowBuilder().addComponents(datetimeInput));
 
         await interaction.showModal(modal);
       } else {
@@ -226,11 +245,20 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (interaction.isModalSubmit() && interaction.customId === 'prochain-stream-modal') {
-      const date = interaction.fields.getTextInputValue('date').trim();
-      const heure = interaction.fields.getTextInputValue('heure').trim();
-      saveNextStream(date, heure);
+      const raw = interaction.fields.getTextInputValue('datetime');
+      const timestamp = parseParisDateTime(raw);
+
+      if (timestamp === null) {
+        await interaction.reply({
+          content: '❌ Format invalide. Utilise JJ/MM/AAAA HH:mm, par exemple : `20/07/2026 18:00`.',
+          ephemeral: true,
+        });
+        return;
+      }
+
+      saveNextStream(timestamp);
       await interaction.reply({
-        content: `✅ Prochain stream mis à jour : **${date}** à **${heure}**`,
+        content: `✅ Prochain stream mis à jour : <t:${timestamp}:F> (<t:${timestamp}:R>)`,
         ephemeral: true,
       });
     }

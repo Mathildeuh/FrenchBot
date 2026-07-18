@@ -15,4 +15,3 @@ EnvironmentFile=/root/FrenchBot/.env
 
 [Install]
 WantedBy=multi-user.target
-
