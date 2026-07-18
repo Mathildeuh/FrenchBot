@@ -2,4 +2,3 @@ node_modules/
 .env
 prochain-stream.json
 streams.json
-compteur.json

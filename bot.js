@@ -12,7 +12,6 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
-  ChannelType,
 } = require('discord.js');
 const { TikTokLiveConnection } = require('tiktok-live-connector');
 
@@ -30,14 +29,6 @@ const GUILD_ID = process.env.GUILD_ID;
 // Tout le monde d'autre ne fait que consulter la date déjà annoncée.
 const SCHEDULE_ADMIN_IDS = ['1417205528429334568', '1527356296012238979'];
 
-// Salon dédié au jeu du comptage : chaque message doit être le nombre suivant celui d'avant.
-// Une erreur (mauvais nombre, message non numérique) remet le compte à 0.
-// Le salon est créé automatiquement (s'il n'existe pas déjà) au démarrage : voir resolveCountingChannel().
-const COUNTING_GUILD_ID = '1314393407262822580';
-const COUNTING_CATEGORY_ID = '1501057586848596158';
-const COUNTING_CHANNEL_NAME = '🔢・comptez';
-const COUNTING_TOPIC = '🔢 Comptez le plus loin possible ! Un message = un chiffre, celui juste après le précédent. Une erreur ? Le compte repart de 0.';
-
 // Intervalle entre chaque vérification (en ms). 60000 = 1 minute.
 // Ne descends pas trop bas pour éviter de te faire rate-limiter.
 const CHECK_INTERVAL = 60_000;
@@ -50,12 +41,7 @@ if (!DISCORD_TOKEN || !CHANNEL_ID || !TIKTOK_USERNAME) {
 }
 
 const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages, // requis pour recevoir messageCreate sur les salons (ex: le salon de comptage)
-    GatewayIntentBits.MessageContent, // requis pour lire le contenu des messages de salon (privilégié, à activer aussi sur le portail développeur)
-    GatewayIntentBits.DirectMessages,
-  ],
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.DirectMessages],
   partials: [Partials.Channel], // requis pour recevoir les messages DM sur un canal pas encore en cache
 });
 
@@ -132,174 +118,6 @@ function saveStreamsPlanning(weekly, dates) {
   fs.writeFileSync(STREAMS_FILE, JSON.stringify({ weekly, dates }, null, 2));
 }
 
-// Fichier où sont persistés le compte en cours et l'ID du salon de comptage (survit aux redémarrages).
-const COUNTING_FILE = path.join(__dirname, 'compteur.json');
-
-function loadCountingState() {
-  try {
-    const data = JSON.parse(fs.readFileSync(COUNTING_FILE, 'utf8'));
-    return { count: data.count || 0, channelId: data.channelId || null };
-  } catch (err) {
-    return { count: 0, channelId: null }; // pas encore de compte enregistré
-  }
-}
-
-function saveCountingState(partial) {
-  fs.writeFileSync(COUNTING_FILE, JSON.stringify({ ...loadCountingState(), ...partial }, null, 2));
-}
-
-function loadCounting() {
-  return loadCountingState().count;
-}
-
-function saveCounting(count) {
-  saveCountingState({ count });
-}
-
-const COUNTING_RULES_TEXT =
-  '• Un message = un chiffre.\n' +
-  '• Il doit être exactement le nombre précédent + 1.\n' +
-  '• Une même personne ne peut pas recompter avant 5 minutes.\n' +
-  '• Une erreur (ou un cooldown non respecté) remet le compte à 0.';
-
-function buildCountingWelcomeEmbed() {
-  return new EmbedBuilder()
-    .setColor(0x2ECC71)
-    .setTitle('🔢 Bienvenue dans le salon de comptage !')
-    .setDescription(`📜 **Règles**\n${COUNTING_RULES_TEXT}\n\n➡️ Premier nombre à écrire : **1**`)
-    .setFooter({ text: 'Comptez le plus loin possible !' });
-}
-
-function buildCountingFailEmbed({ authorId, brokenAt, reason }) {
-  return new EmbedBuilder()
-    .setColor(0xFF0000)
-    .setTitle('💥 Perdu ! Le compte repart de 0')
-    .setDescription(
-      `<@${authorId}> a tout gâché à **${brokenAt}** (${reason}).\n\n` +
-        `📜 **Règles**\n${COUNTING_RULES_TEXT}\n\n` +
-        '➡️ Prochain nombre à écrire : **1**',
-    )
-    .setFooter({ text: 'Comptez le plus loin possible !' });
-}
-
-// Cooldown anti-spam : une même personne doit attendre entre deux comptages valides.
-// Suivi en mémoire (pas persisté) : un redémarrage du bot réinitialise juste les cooldowns en cours.
-const COUNTING_COOLDOWN_MS = 5 * 60 * 1000;
-const lastCountByUser = new Map();
-
-// Vérifie chaque message du salon de comptage : réagit ✅ si c'est le bon nombre (et que
-// l'auteur n'est pas en cooldown), sinon remet le compte à 0 et explique pourquoi via un embed.
-async function handleCountingMessage(message) {
-  const content = message.content.trim();
-  const current = loadCounting();
-  const expected = current + 1;
-  const isRightNumber = /^\d+$/.test(content) && Number(content) === expected;
-
-  console.log(`🔢 Message reçu dans le salon de comptage de ${message.author.tag} : "${content}" (attendu : ${expected})`);
-
-  try {
-    if (isRightNumber) {
-      const lastCount = lastCountByUser.get(message.author.id) || 0;
-      const remainingMs = COUNTING_COOLDOWN_MS - (Date.now() - lastCount);
-
-      if (remainingMs > 0) {
-        console.log(`⏳ ${message.author.tag} est en cooldown (${Math.ceil(remainingMs / 60_000)} min restantes), reset du compte.`);
-        saveCounting(0);
-        await message.channel.send({
-          embeds: [
-            buildCountingFailEmbed({
-              authorId: message.author.id,
-              brokenAt: current,
-              reason: `a recompté trop vite, attends encore ${Math.ceil(remainingMs / 60_000)} min`,
-            }),
-          ],
-        });
-        return;
-      }
-
-      saveCounting(expected);
-      lastCountByUser.set(message.author.id, Date.now());
-      await message.react('✅');
-      console.log(`✅ Bon compte : ${expected}.`);
-      return;
-    }
-
-    console.log(`❌ Mauvais compte de ${message.author.tag}, reset à 0.`);
-    saveCounting(0);
-    await message.channel.send({
-      embeds: [
-        buildCountingFailEmbed({
-          authorId: message.author.id,
-          brokenAt: current,
-          reason: `a écrit \`${(content || '*message vide*').replace(/`/g, "'").slice(0, 200)}\` au lieu de \`${expected}\``,
-        }),
-      ],
-    });
-  } catch (err) {
-    console.error('❌ Erreur dans le salon de comptage :', err.message);
-  }
-}
-
-// Envoie les règles en embed si le salon est totalement vide (première mise en place).
-async function sendCountingWelcomeIfEmpty(channel) {
-  const messages = await channel.messages.fetch({ limit: 1 });
-  if (messages.size === 0) {
-    await channel.send({ embeds: [buildCountingWelcomeEmbed()] });
-  }
-}
-
-// Retrouve le salon de comptage (via l'ID persisté, puis par nom+catégorie), et le crée
-// automatiquement dans COUNTING_CATEGORY_ID s'il n'existe nulle part encore.
-async function resolveCountingChannel() {
-  const stored = loadCountingState().channelId;
-
-  if (stored) {
-    try {
-      const channel = await client.channels.fetch(stored);
-      if (channel) return channel;
-    } catch (err) {
-      console.warn(`⚠️ Salon de comptage enregistré (${stored}) introuvable, nouvelle résolution...`);
-    }
-  }
-
-  const guild = await client.guilds.fetch(COUNTING_GUILD_ID);
-  const channels = await guild.channels.fetch();
-  const existing = channels.find(
-    (c) => c && c.parentId === COUNTING_CATEGORY_ID && c.name === COUNTING_CHANNEL_NAME,
-  );
-
-  if (existing) {
-    saveCountingState({ channelId: existing.id });
-    return existing;
-  }
-
-  const created = await guild.channels.create({
-    name: COUNTING_CHANNEL_NAME,
-    type: ChannelType.GuildText,
-    parent: COUNTING_CATEGORY_ID,
-  });
-  saveCountingState({ channelId: created.id });
-  console.log(`✅ Salon de comptage créé automatiquement : ${created.id}`);
-  return created;
-}
-
-// Prépare le salon de comptage au démarrage : le crée si besoin, fixe sa description une bonne
-// fois pour toutes (idempotent, pour ne pas cogner la limite de changements de topic de Discord
-// à chaque redémarrage) et poste le message de bienvenue si personne n'a encore posté.
-async function setupCountingChannel() {
-  try {
-    const channel = await resolveCountingChannel();
-    countingChannelId = channel.id;
-
-    if (channel.topic !== COUNTING_TOPIC) {
-      await channel.setTopic(COUNTING_TOPIC);
-    }
-    await sendCountingWelcomeIfEmpty(channel);
-  } catch (err) {
-    console.error('❌ Impossible de préparer le salon de comptage :', err.message);
-  }
-}
-
 function buildStreamsEmbed() {
   const { weekly, dates } = loadStreamsPlanning();
   const now = Math.floor(Date.now() / 1000);
@@ -343,7 +161,6 @@ const TOPIC_LIVE = `🔴 En live sur TikTok ! https://www.tiktok.com/@${TIKTOK_U
 const TOPIC_OFFLINE = '⚪ Pas en live actuellement';
 
 let isCurrentlyLive = false; // état mémorisé pour ne notifier qu'une seule fois par live
-let countingChannelId = null; // résolu au démarrage par setupCountingChannel()
 
 function formatNextStreamText() {
   const next = loadNextStream();
@@ -608,14 +425,7 @@ client.on('interactionCreate', async (interaction) => {
 // Réponse automatique en DM : peu importe ce qu'on écrit au bot, il donne la date
 // du prochain stream et si le live TikTok est en cours.
 client.on('messageCreate', async (message) => {
-  if (message.author.bot) return;
-
-  if (message.guild) {
-    if (countingChannelId && message.channel.id === countingChannelId) {
-      await handleCountingMessage(message);
-    }
-    return;
-  }
+  if (message.author.bot || message.guild) return;
 
   console.log(`📩 DM reçu de ${message.author.tag} (${message.author.id})`);
   try {
@@ -632,7 +442,6 @@ client.once('ready', async () => {
 
   await registerCommands();
   await updateChannelTopic(false); // état par défaut au démarrage : pas en live
-  await setupCountingChannel();
 
   checkTikTokLive(); // première vérif immédiate (corrigera le topic si elle est déjà en live)
   setInterval(checkTikTokLive, CHECK_INTERVAL);
