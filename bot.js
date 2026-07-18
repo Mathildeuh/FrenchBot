@@ -138,43 +138,77 @@ function saveCounting(count) {
   fs.writeFileSync(COUNTING_FILE, JSON.stringify({ count }, null, 2));
 }
 
-function buildCountingRulesEmbed({ authorId, brokenAt, expected, got }) {
+const COUNTING_RULES_TEXT =
+  '• Un message = un chiffre.\n' +
+  '• Il doit être exactement le nombre précédent + 1.\n' +
+  '• Une même personne ne peut pas recompter avant 5 minutes.\n' +
+  '• Une erreur (ou un cooldown non respecté) remet le compte à 0.';
+
+function buildCountingWelcomeEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x2ECC71)
+    .setTitle('🔢 Bienvenue dans le salon de comptage !')
+    .setDescription(`📜 **Règles**\n${COUNTING_RULES_TEXT}\n\n➡️ Premier nombre à écrire : **1**`)
+    .setFooter({ text: 'Comptez le plus loin possible !' });
+}
+
+function buildCountingFailEmbed({ authorId, brokenAt, reason }) {
   return new EmbedBuilder()
     .setColor(0xFF0000)
-    .setTitle('❌ Perdu ! Le compte repart de 0')
+    .setTitle('💥 Perdu ! Le compte repart de 0')
     .setDescription(
-      `<@${authorId}> a cassé le compte à **${brokenAt}** (écrit \`${got}\` au lieu de \`${expected}\`).\n\n` +
-        '📜 **Règles du salon**\n' +
-        '• Un message = un chiffre.\n' +
-        '• Il doit être exactement le nombre précédent + 1.\n' +
-        '• Une erreur remet le compte à 0.\n\n' +
+      `<@${authorId}> a tout gâché à **${brokenAt}** (${reason}).\n\n` +
+        `📜 **Règles**\n${COUNTING_RULES_TEXT}\n\n` +
         '➡️ Prochain nombre à écrire : **1**',
     )
     .setFooter({ text: 'Comptez le plus loin possible !' });
 }
 
-// Vérifie chaque message du salon de comptage : incrémente si c'est le bon nombre,
-// sinon remet le compte à 0 et explique pourquoi via un embed.
+// Cooldown anti-spam : une même personne doit attendre entre deux comptages valides.
+// Suivi en mémoire (pas persisté) : un redémarrage du bot réinitialise juste les cooldowns en cours.
+const COUNTING_COOLDOWN_MS = 5 * 60 * 1000;
+const lastCountByUser = new Map();
+
+// Vérifie chaque message du salon de comptage : réagit ✅ si c'est le bon nombre (et que
+// l'auteur n'est pas en cooldown), sinon remet le compte à 0 et explique pourquoi via un embed.
 async function handleCountingMessage(message) {
   const content = message.content.trim();
   const current = loadCounting();
   const expected = current + 1;
-  const isCorrect = /^\d+$/.test(content) && Number(content) === expected;
+  const isRightNumber = /^\d+$/.test(content) && Number(content) === expected;
 
   try {
-    if (isCorrect) {
+    if (isRightNumber) {
+      const lastCount = lastCountByUser.get(message.author.id) || 0;
+      const remainingMs = COUNTING_COOLDOWN_MS - (Date.now() - lastCount);
+
+      if (remainingMs > 0) {
+        saveCounting(0);
+        await message.channel.send({
+          embeds: [
+            buildCountingFailEmbed({
+              authorId: message.author.id,
+              brokenAt: current,
+              reason: `a recompté trop vite, attends encore ${Math.ceil(remainingMs / 60_000)} min`,
+            }),
+          ],
+        });
+        return;
+      }
+
       saveCounting(expected);
+      lastCountByUser.set(message.author.id, Date.now());
+      await message.react('✅');
       return;
     }
 
     saveCounting(0);
     await message.channel.send({
       embeds: [
-        buildCountingRulesEmbed({
+        buildCountingFailEmbed({
           authorId: message.author.id,
           brokenAt: current,
-          expected,
-          got: (content || '*message vide*').replace(/`/g, "'").slice(0, 200),
+          reason: `a écrit \`${(content || '*message vide*').replace(/`/g, "'").slice(0, 200)}\` au lieu de \`${expected}\``,
         }),
       ],
     });
@@ -183,16 +217,28 @@ async function handleCountingMessage(message) {
   }
 }
 
-// Définit la description du salon de comptage une bonne fois pour toutes (idempotent,
-// pour ne pas cogner la limite de changements de topic de Discord à chaque redémarrage).
-async function ensureCountingChannelTopic() {
+// Envoie les règles en embed si le salon est totalement vide (première mise en place).
+async function sendCountingWelcomeIfEmpty(channel) {
+  const messages = await channel.messages.fetch({ limit: 1 });
+  if (messages.size === 0) {
+    await channel.send({ embeds: [buildCountingWelcomeEmbed()] });
+  }
+}
+
+// Prépare le salon de comptage au démarrage : description fixée une bonne fois pour toutes
+// (idempotent, pour ne pas cogner la limite de changements de topic de Discord à chaque redémarrage)
+// et message de bienvenue si personne n'a encore posté.
+async function setupCountingChannel() {
   try {
     const channel = await client.channels.fetch(COUNTING_CHANNEL_ID);
-    if (channel && channel.topic !== COUNTING_TOPIC) {
+    if (!channel) return;
+
+    if (channel.topic !== COUNTING_TOPIC) {
       await channel.setTopic(COUNTING_TOPIC);
     }
+    await sendCountingWelcomeIfEmpty(channel);
   } catch (err) {
-    console.error('❌ Impossible de définir la description du salon de comptage :', err.message);
+    console.error('❌ Impossible de préparer le salon de comptage :', err.message);
   }
 }
 
@@ -527,7 +573,7 @@ client.once('ready', async () => {
 
   await registerCommands();
   await updateChannelTopic(false); // état par défaut au démarrage : pas en live
-  await ensureCountingChannelTopic();
+  await setupCountingChannel();
 
   checkTikTokLive(); // première vérif immédiate (corrigera le topic si elle est déjà en live)
   setInterval(checkTikTokLive, CHECK_INTERVAL);

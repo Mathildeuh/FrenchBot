@@ -61,9 +61,9 @@ There's no local TypeScript types for `RoomInfo` (it's `Record<string, any>`); t
 ### Counting channel (`compteur.json`)
 
 - `COUNTING_CHANNEL_ID` (hardcoded, same style as `SCHEDULE_ADMIN_IDS`) is the one channel where `handleCountingMessage()` runs on every non-bot message.
-- The rule: a message must be exactly the last successful count + 1 (checked via `/^\d+$/` then numeric equality — no leading text, decimals, or negative numbers). Correct messages just persist the new count to `compteur.json` (`{ count }`) with no bot reply. Any miss (wrong number or non-numeric content) resets `count` to `0` and posts an embed (`buildCountingRulesEmbed()`) naming who broke it, at what count, and restating the rules.
-- There's no "same person can't count twice in a row" rule — only the sequential-number check described above.
-- The channel topic (`COUNTING_TOPIC`) is set once at startup via `ensureCountingChannelTopic()`, which skips the API call if the topic already matches (Discord rate-limits topic edits to ~2/10min).
+- The rule: a message must be exactly the last successful count + 1 (checked via `/^\d+$/` then numeric equality — no leading text, decimals, or negative numbers). Correct messages persist the new count to `compteur.json` (`{ count }`) and get a ✅ reaction. Any miss (wrong number, non-numeric content, or a cooldown violation) resets `count` to `0` and posts a "💥 ... a tout gâché" embed (`buildCountingFailEmbed()`) naming who broke it, at what count, why, and restating the rules (`COUNTING_RULES_TEXT`).
+- Per-user cooldown: `lastCountByUser` (in-memory `Map`, not persisted — a bot restart just clears pending cooldowns) tracks each user's last successful count timestamp. A second correct-number message from the same user within `COUNTING_COOLDOWN_MS` (5 min) is treated as a violation — same reset+embed path as a wrong number, just with a different `reason` string.
+- `setupCountingChannel()` runs once at startup: sets the channel topic (`COUNTING_TOPIC`, skipped if already correct — Discord rate-limits topic edits to ~2/10min) and, via `sendCountingWelcomeIfEmpty()`, posts the rules as a green embed (`buildCountingWelcomeEmbed()`) if the channel has zero messages (first-time setup only — never repeats once someone has posted).
 
 ## Deployment (Debian)
 
