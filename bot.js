@@ -14,7 +14,7 @@ const {
   ButtonStyle,
   ActivityType,
 } = require('discord.js');
-const { TikTokLiveConnection } = require('tiktok-live-connector');
+const { TikTokLiveConnection, WebcastEvent, ControlEvent } = require('tiktok-live-connector');
 
 // ==================== CONFIGURATION ====================
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
@@ -163,6 +163,12 @@ const TOPIC_OFFLINE = '⚪ Pas en live actuellement';
 
 let isCurrentlyLive = false; // état mémorisé pour ne notifier qu'une seule fois par live
 
+// Pendant un live, ces trois variables suivent la connexion webcast persistante ouverte pour
+// écouter cadeaux/likes/follows/partages/viewers/chat en temps réel (voir attachLiveListeners).
+let liveConnection = null;
+let liveStats = null;
+let liveEndHandled = false; // évite un double envoi du récap si streamEnd ET disconnected se déclenchent
+
 function formatNextStreamText() {
   const next = loadNextStream();
   if (!next) return "📅 Aucun prochain stream n'est annoncé pour le moment.";
@@ -209,7 +215,183 @@ function updateBotPresence(isLive, viewerCount) {
   }
 }
 
+function createEmptyLiveStats(initialViewerCount) {
+  const initial = typeof initialViewerCount === 'number' ? initialViewerCount : 0;
+  return {
+    startedAt: Date.now(),
+    totalGifts: 0,
+    totalDiamonds: 0, // "pièces" gagnées (valeur en diamants des cadeaux)
+    likeTotal: 0,
+    followCount: 0,
+    shareCount: 0,
+    viewerMax: initial,
+    viewerSampleSum: 0,
+    viewerSampleCount: 0,
+    lastViewerCount: initial,
+    questionCounts: new Map(), // texte de question normalisé -> nombre d'occurrences
+  };
+}
+
+// Convertit une durée en ms en texte court ("1h32" ou "45 min").
+function formatDuration(ms) {
+  const totalMinutes = Math.max(0, Math.round(ms / 60_000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return hours > 0 ? `${hours}h${String(minutes).padStart(2, '0')}` : `${minutes} min`;
+}
+
+// Branche les écouteurs temps réel sur la connexion webcast le temps du live, pour construire
+// le récap envoyé en DM à la fin (voir sendLiveRecapDM). N'est appelée qu'une fois par live.
+function attachLiveListeners(connection) {
+  connection.on(WebcastEvent.GIFT, (msg) => {
+    if (!liveStats) return;
+    const gift = msg.gift;
+    // Cadeau envoyé en combo (streak) : TikTok renvoie un événement par palier du combo,
+    // on n'additionne qu'au dernier (repeatEnd) pour ne pas compter plusieurs fois le même envoi.
+    if (gift?.type === 1 && !msg.repeatEnd) return;
+    const count = msg.repeatCount || 1;
+    liveStats.totalGifts += count;
+    liveStats.totalDiamonds += count * (gift?.diamondCount || 0);
+  });
+
+  connection.on(WebcastEvent.LIKE, (msg) => {
+    if (!liveStats) return;
+    // "total" est déjà le cumul depuis le début du live, pas besoin de sommer nous-mêmes.
+    const total = parseInt(msg.total, 10);
+    if (!Number.isNaN(total)) liveStats.likeTotal = total;
+  });
+
+  connection.on(WebcastEvent.FOLLOW, () => {
+    if (liveStats) liveStats.followCount += 1;
+  });
+
+  connection.on(WebcastEvent.SHARE, () => {
+    if (liveStats) liveStats.shareCount += 1;
+  });
+
+  connection.on(WebcastEvent.ROOM_USER, (msg) => {
+    if (!liveStats) return;
+    const count = parseInt(msg.total, 10);
+    if (Number.isNaN(count)) return;
+    liveStats.lastViewerCount = count;
+    if (count > liveStats.viewerMax) liveStats.viewerMax = count;
+    liveStats.viewerSampleSum += count;
+    liveStats.viewerSampleCount += 1;
+  });
+
+  connection.on(WebcastEvent.CHAT, (msg) => {
+    if (!liveStats) return;
+    const text = (msg.content || '').trim();
+    if (!text.includes('?')) return;
+    // Regroupement simple par texte normalisé (pas de rapprochement sémantique) : suffisant
+    // pour repérer les questions tapées à l'identique plusieurs fois par des viewers différents.
+    const key = text.toLowerCase().replace(/\s+/g, ' ');
+    liveStats.questionCounts.set(key, (liveStats.questionCounts.get(key) || 0) + 1);
+  });
+
+  connection.on(WebcastEvent.STREAM_END, () => {
+    if (liveEndHandled) return;
+    liveEndHandled = true;
+    console.log(`⚪ ${TIKTOK_USERNAME} a terminé son live (streamEnd).`);
+    finalizeLiveEnd();
+  });
+
+  connection.on(ControlEvent.DISCONNECTED, async () => {
+    if (liveEndHandled) return; // déjà traité via streamEnd
+    console.warn('⚠️ Connexion live coupée, tentative de reconnexion...');
+    await new Promise((resolve) => setTimeout(resolve, 5000));
+    if (liveEndHandled) return;
+    try {
+      await connection.connect(connection.roomId);
+      console.log('✅ Reconnecté au live.');
+    } catch (err) {
+      if (liveEndHandled) return;
+      liveEndHandled = true;
+      console.log('⚪ Reconnexion impossible, live considéré comme terminé.');
+      await finalizeLiveEnd();
+    }
+  });
+
+  connection.on(ControlEvent.ERROR, (err) => {
+    console.error('❌ Erreur sur la connexion live TikTok :', err?.info || err);
+  });
+}
+
+// Envoie le récap du live (durée, cadeaux/pièces, likes, follows, partages, viewers, questions
+// fréquentes) en DM aux admins définis dans SCHEDULE_ADMIN_IDS.
+async function sendLiveRecapDM(stats) {
+  const durationText = formatDuration(Date.now() - stats.startedAt);
+  const viewerAvg = stats.viewerSampleCount
+    ? Math.round(stats.viewerSampleSum / stats.viewerSampleCount)
+    : stats.viewerMax;
+
+  const topQuestions = [...stats.questionCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5);
+
+  const embed = new EmbedBuilder()
+    .setColor(0xFE2C55)
+    .setTitle(`📊 Récap du live de ${TIKTOK_USERNAME}`)
+    .addFields(
+      { name: '⏱️ Durée', value: durationText, inline: true },
+      { name: '👀 Viewers max', value: stats.viewerMax.toLocaleString('fr-FR'), inline: true },
+      { name: '👀 Viewers moyen', value: viewerAvg.toLocaleString('fr-FR'), inline: true },
+      { name: '🎁 Cadeaux reçus', value: stats.totalGifts.toLocaleString('fr-FR'), inline: true },
+      { name: '💎 Pièces gagnées', value: stats.totalDiamonds.toLocaleString('fr-FR'), inline: true },
+      { name: '❤️ Likes', value: stats.likeTotal.toLocaleString('fr-FR'), inline: true },
+      { name: '➕ Nouveaux abonnés', value: stats.followCount.toLocaleString('fr-FR'), inline: true },
+      { name: '🔁 Partages', value: stats.shareCount.toLocaleString('fr-FR'), inline: true },
+      {
+        name: '❓ Questions les plus posées',
+        value: topQuestions.length
+          ? topQuestions.map(([question, count]) => `• (${count}x) ${question}`).join('\n').slice(0, 1024)
+          : 'Aucune question récurrente détectée.',
+      },
+    )
+    .setTimestamp();
+
+  for (const adminId of SCHEDULE_ADMIN_IDS) {
+    try {
+      const user = await client.users.fetch(adminId);
+      await user.send({ embeds: [embed] });
+    } catch (err) {
+      console.error(`❌ Impossible d'envoyer le récap en DM à ${adminId} :`, err.message);
+    }
+  }
+}
+
+// Point de sortie unique de fin de live, que ce soit via streamEnd ou une déconnexion définitive :
+// remet l'état à zéro, met à jour topic/statut, et envoie le récap.
+async function finalizeLiveEnd() {
+  isCurrentlyLive = false;
+  const stats = liveStats;
+  const connection = liveConnection;
+  liveConnection = null;
+  liveStats = null;
+
+  await updateChannelTopic(false);
+  updateBotPresence(false);
+
+  try {
+    await connection?.disconnect();
+  } catch (_) {}
+
+  if (stats) await sendLiveRecapDM(stats);
+}
+
 async function checkTikTokLive() {
+  // Pendant un live, la connexion persistante (voir attachLiveListeners) suit déjà tout en temps
+  // réel ; on se contente ici de rafraîchir le statut du bot avec le dernier viewer count connu.
+  if (isCurrentlyLive) {
+    updateBotPresence(true, liveStats?.lastViewerCount);
+    // Filet de sécurité : si la connexion s'est coupée silencieusement sans déclencher
+    // 'disconnected' (cas rare), on le détecte ici au pire au poll suivant.
+    if (liveConnection && !liveConnection.isConnected && !liveEndHandled) {
+      liveEndHandled = true;
+      console.log('⚪ Connexion live coupée silencieusement, live considéré comme terminé.');
+      await finalizeLiveEnd();
+    }
+    return;
+  }
+
   const connection = new TikTokLiveConnection(TIKTOK_USERNAME, {
     signApiKey: EULER_API_KEY,
   });
@@ -217,26 +399,20 @@ async function checkTikTokLive() {
   try {
     const state = await connection.connect();
 
-    // Elle vient de passer en live (elle ne l'était pas avant)
-    if (!isCurrentlyLive) {
-      isCurrentlyLive = true;
-      console.log(`🔴 ${TIKTOK_USERNAME} est en live ! Room ID: ${state.roomId}`);
-      await updateChannelTopic(true);
-      await sendLiveAlert(state);
-    }
-    // Rafraîchi à chaque poll (pas seulement à la transition) pour que le nombre de viewers reste à jour.
-    updateBotPresence(true, state.roomInfo?.user_count);
+    // Elle vient de passer en live : on garde CETTE connexion ouverte (pas de disconnect) pour
+    // écouter cadeaux/likes/follows/partages/viewers/chat jusqu'à la fin du live.
+    isCurrentlyLive = true;
+    liveEndHandled = false;
+    liveConnection = connection;
+    liveStats = createEmptyLiveStats(state.roomInfo?.user_count);
+    attachLiveListeners(connection);
+
+    console.log(`🔴 ${TIKTOK_USERNAME} est en live ! Room ID: ${state.roomId}`);
+    await updateChannelTopic(true);
+    updateBotPresence(true, liveStats.lastViewerCount);
+    await sendLiveAlert(state);
   } catch (err) {
-    // Pas en live, ou erreur de connexion : dans les deux cas on considère "pas en live"
-    if (isCurrentlyLive) {
-      console.log(`⚪ ${TIKTOK_USERNAME} n'est plus en live.`);
-      await updateChannelTopic(false);
-      updateBotPresence(false);
-    }
-    isCurrentlyLive = false;
-  } finally {
-    // On coupe la connexion webcast, on ne veut pas rester connecté au chat,
-    // juste vérifier le statut périodiquement.
+    // Pas en live pour l'instant : on ne garde rien ouvert, le prochain poll réessaiera.
     try {
       connection.disconnect();
     } catch (_) {}
