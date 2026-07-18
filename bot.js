@@ -12,6 +12,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ChannelType,
 } = require('discord.js');
 const { TikTokLiveConnection } = require('tiktok-live-connector');
 
@@ -31,7 +32,10 @@ const SCHEDULE_ADMIN_IDS = ['1417205528429334568', '1527356296012238979'];
 
 // Salon dédié au jeu du comptage : chaque message doit être le nombre suivant celui d'avant.
 // Une erreur (mauvais nombre, message non numérique) remet le compte à 0.
-const COUNTING_CHANNEL_ID = '1528164616042057830';
+// Le salon est créé automatiquement (s'il n'existe pas déjà) au démarrage : voir resolveCountingChannel().
+const COUNTING_GUILD_ID = '1314393407262822580';
+const COUNTING_CATEGORY_ID = '1501057586848596158';
+const COUNTING_CHANNEL_NAME = '🔢・comptez';
 const COUNTING_TOPIC = '🔢 Comptez le plus loin possible ! Un message = un chiffre, celui juste après le précédent. Une erreur ? Le compte repart de 0.';
 
 // Intervalle entre chaque vérification (en ms). 60000 = 1 minute.
@@ -128,19 +132,28 @@ function saveStreamsPlanning(weekly, dates) {
   fs.writeFileSync(STREAMS_FILE, JSON.stringify({ weekly, dates }, null, 2));
 }
 
-// Fichier où est persisté le compte en cours du salon de comptage (survit aux redémarrages).
+// Fichier où sont persistés le compte en cours et l'ID du salon de comptage (survit aux redémarrages).
 const COUNTING_FILE = path.join(__dirname, 'compteur.json');
 
-function loadCounting() {
+function loadCountingState() {
   try {
-    return JSON.parse(fs.readFileSync(COUNTING_FILE, 'utf8')).count || 0;
+    const data = JSON.parse(fs.readFileSync(COUNTING_FILE, 'utf8'));
+    return { count: data.count || 0, channelId: data.channelId || null };
   } catch (err) {
-    return 0; // pas encore de compte enregistré
+    return { count: 0, channelId: null }; // pas encore de compte enregistré
   }
 }
 
+function saveCountingState(partial) {
+  fs.writeFileSync(COUNTING_FILE, JSON.stringify({ ...loadCountingState(), ...partial }, null, 2));
+}
+
+function loadCounting() {
+  return loadCountingState().count;
+}
+
 function saveCounting(count) {
-  fs.writeFileSync(COUNTING_FILE, JSON.stringify({ count }, null, 2));
+  saveCountingState({ count });
 }
 
 const COUNTING_RULES_TEXT =
@@ -235,13 +248,48 @@ async function sendCountingWelcomeIfEmpty(channel) {
   }
 }
 
-// Prépare le salon de comptage au démarrage : description fixée une bonne fois pour toutes
-// (idempotent, pour ne pas cogner la limite de changements de topic de Discord à chaque redémarrage)
-// et message de bienvenue si personne n'a encore posté.
+// Retrouve le salon de comptage (via l'ID persisté, puis par nom+catégorie), et le crée
+// automatiquement dans COUNTING_CATEGORY_ID s'il n'existe nulle part encore.
+async function resolveCountingChannel() {
+  const stored = loadCountingState().channelId;
+
+  if (stored) {
+    try {
+      const channel = await client.channels.fetch(stored);
+      if (channel) return channel;
+    } catch (err) {
+      console.warn(`⚠️ Salon de comptage enregistré (${stored}) introuvable, nouvelle résolution...`);
+    }
+  }
+
+  const guild = await client.guilds.fetch(COUNTING_GUILD_ID);
+  const channels = await guild.channels.fetch();
+  const existing = channels.find(
+    (c) => c && c.parentId === COUNTING_CATEGORY_ID && c.name === COUNTING_CHANNEL_NAME,
+  );
+
+  if (existing) {
+    saveCountingState({ channelId: existing.id });
+    return existing;
+  }
+
+  const created = await guild.channels.create({
+    name: COUNTING_CHANNEL_NAME,
+    type: ChannelType.GuildText,
+    parent: COUNTING_CATEGORY_ID,
+  });
+  saveCountingState({ channelId: created.id });
+  console.log(`✅ Salon de comptage créé automatiquement : ${created.id}`);
+  return created;
+}
+
+// Prépare le salon de comptage au démarrage : le crée si besoin, fixe sa description une bonne
+// fois pour toutes (idempotent, pour ne pas cogner la limite de changements de topic de Discord
+// à chaque redémarrage) et poste le message de bienvenue si personne n'a encore posté.
 async function setupCountingChannel() {
   try {
-    const channel = await client.channels.fetch(COUNTING_CHANNEL_ID);
-    if (!channel) return;
+    const channel = await resolveCountingChannel();
+    countingChannelId = channel.id;
 
     if (channel.topic !== COUNTING_TOPIC) {
       await channel.setTopic(COUNTING_TOPIC);
@@ -295,6 +343,7 @@ const TOPIC_LIVE = `🔴 En live sur TikTok ! https://www.tiktok.com/@${TIKTOK_U
 const TOPIC_OFFLINE = '⚪ Pas en live actuellement';
 
 let isCurrentlyLive = false; // état mémorisé pour ne notifier qu'une seule fois par live
+let countingChannelId = null; // résolu au démarrage par setupCountingChannel()
 
 function formatNextStreamText() {
   const next = loadNextStream();
@@ -562,7 +611,7 @@ client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
   if (message.guild) {
-    if (message.channel.id === COUNTING_CHANNEL_ID) {
+    if (countingChannelId && message.channel.id === countingChannelId) {
       await handleCountingMessage(message);
     }
     return;
