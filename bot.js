@@ -12,6 +12,7 @@ const {
   ActionRowBuilder,
   ButtonBuilder,
   ButtonStyle,
+  ActivityType,
 } = require('discord.js');
 const { TikTokLiveConnection } = require('tiktok-live-connector');
 
@@ -188,6 +189,26 @@ async function updateChannelTopic(isLive) {
   }
 }
 
+// Le statut du bot (activité "personnalisée", sans préfixe "Joue à"/"Regarde") reflète l'état du live.
+// Appelé à chaque poll tant que le live continue, pas seulement sur la transition, pour que le
+// nombre de viewers affiché reste à jour.
+function updateBotPresence(isLive, viewerCount) {
+  const state = isLive
+    ? (typeof viewerCount === 'number'
+      ? `🔴 En live avec ${viewerCount.toLocaleString('fr-FR')} viewers`
+      : '🔴 En live sur TikTok')
+    : '⚪ Pas en live actuellement';
+
+  try {
+    client.user.setPresence({
+      status: isLive ? 'online' : 'idle',
+      activities: [{ name: state, state, type: ActivityType.Custom }],
+    });
+  } catch (err) {
+    console.error('❌ Impossible de mettre à jour le statut du bot :', err.message);
+  }
+}
+
 async function checkTikTokLive() {
   const connection = new TikTokLiveConnection(TIKTOK_USERNAME, {
     signApiKey: EULER_API_KEY,
@@ -203,11 +224,14 @@ async function checkTikTokLive() {
       await updateChannelTopic(true);
       await sendLiveAlert(state);
     }
+    // Rafraîchi à chaque poll (pas seulement à la transition) pour que le nombre de viewers reste à jour.
+    updateBotPresence(true, state.roomInfo?.user_count);
   } catch (err) {
     // Pas en live, ou erreur de connexion : dans les deux cas on considère "pas en live"
     if (isCurrentlyLive) {
       console.log(`⚪ ${TIKTOK_USERNAME} n'est plus en live.`);
       await updateChannelTopic(false);
+      updateBotPresence(false);
     }
     isCurrentlyLive = false;
   } finally {
@@ -442,6 +466,7 @@ client.once('ready', async () => {
 
   await registerCommands();
   await updateChannelTopic(false); // état par défaut au démarrage : pas en live
+  updateBotPresence(false);
 
   checkTikTokLive(); // première vérif immédiate (corrigera le topic si elle est déjà en live)
   setInterval(checkTikTokLive, CHECK_INTERVAL);
