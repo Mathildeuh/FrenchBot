@@ -1,3 +1,4 @@
 node_modules/
 .env
 prochain-stream.json
+streams.json

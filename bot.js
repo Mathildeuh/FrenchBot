@@ -10,6 +10,8 @@ const {
   TextInputBuilder,
   TextInputStyle,
   ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle,
 } = require('discord.js');
 const { TikTokLiveConnection } = require('tiktok-live-connector');
 
@@ -81,6 +83,67 @@ function parseParisDateTime(input) {
   const utcGuess = Date.UTC(year, month - 1, day, hour, minute);
   const realUtcMs = utcGuess - parisOffsetMinutes(utcGuess) * 60_000;
   return Math.floor(realUtcMs / 1000);
+}
+
+// Inverse de parseParisDateTime : reconstruit "JJ/MM/AAAA HH:mm" en heure de Paris à partir
+// d'un timestamp Unix, pour pré-remplir le formulaire d'édition avec les valeurs déjà enregistrées.
+function formatParisDateTime(timestampSeconds) {
+  const parts = new Intl.DateTimeFormat('fr-FR', {
+    timeZone: 'Europe/Paris',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).formatToParts(timestampSeconds * 1000);
+  const get = (type) => parts.find((p) => p.type === type)?.value;
+  return `${get('day')}/${get('month')}/${get('year')} ${get('hour')}:${get('minute')}`;
+}
+
+// Fichier où est persisté le planning : jours récurrents (texte libre) + liste de dates ponctuelles
+// (timestamps Unix), survit aux redémarrages du bot.
+const STREAMS_FILE = path.join(__dirname, 'streams.json');
+
+function loadStreamsPlanning() {
+  try {
+    const data = JSON.parse(fs.readFileSync(STREAMS_FILE, 'utf8'));
+    return { weekly: data.weekly || [], dates: data.dates || [] };
+  } catch (err) {
+    return { weekly: [], dates: [] };
+  }
+}
+
+function saveStreamsPlanning(weekly, dates) {
+  fs.writeFileSync(STREAMS_FILE, JSON.stringify({ weekly, dates }, null, 2));
+}
+
+function buildStreamsEmbed() {
+  const { weekly, dates } = loadStreamsPlanning();
+  const now = Math.floor(Date.now() / 1000);
+  const upcoming = dates.filter((ts) => ts >= now).sort((a, b) => a - b);
+
+  return new EmbedBuilder()
+    .setColor(0xFE2C55)
+    .setTitle(`📆 Planning de ${TIKTOK_USERNAME}`)
+    .addFields(
+      {
+        name: 'En ce moment',
+        value: formatLiveStatusText(),
+      },
+      {
+        name: '🔁 Chaque semaine',
+        value: weekly.length ? weekly.map((line) => `• ${line}`).join('\n') : 'Pas encore défini.',
+      },
+      {
+        name: '🗓️ Prochaines dates',
+        value: upcoming.length
+          ? upcoming.map((ts) => `• <t:${ts}:F> (<t:${ts}:R>)`).join('\n')
+          : 'Aucune date programmée pour le moment.',
+      },
+    )
+    .setFooter({ text: 'Surveillance TikTok Live' })
+    .setTimestamp();
 }
 
 // Le client Discord se reconnecte déjà tout seul en cas de coupure réseau ;
@@ -203,6 +266,7 @@ async function sendLiveAlert(state) {
 async function registerCommands() {
   const commands = [
     { name: 'prochain-stream', description: 'Affiche la date du prochain stream' },
+    { name: 'streams', description: 'Affiche le planning (chaque semaine + prochaines dates)' },
   ];
 
   try {
@@ -212,9 +276,9 @@ async function registerCommands() {
     } else {
       await client.application.commands.set(commands);
     }
-    console.log('✅ Commande /prochain-stream enregistrée.');
+    console.log('✅ Commandes /prochain-stream et /streams enregistrées.');
   } catch (err) {
-    console.error("❌ Impossible d'enregistrer la commande /prochain-stream :", err.message);
+    console.error("❌ Impossible d'enregistrer les commandes :", err.message);
   }
 }
 
@@ -261,6 +325,97 @@ client.on('interactionCreate', async (interaction) => {
         content: `✅ Prochain stream mis à jour : <t:${timestamp}:F> (<t:${timestamp}:R>)`,
         ephemeral: true,
       });
+      return;
+    }
+
+    // /streams : tout le monde voit le planning stylé ; les admins reçoivent en plus,
+    // en privé, un bouton pour ouvrir le formulaire d'édition (pré-rempli avec les valeurs actuelles).
+    if (interaction.isChatInputCommand() && interaction.commandName === 'streams') {
+      await interaction.reply({ embeds: [buildStreamsEmbed()] });
+
+      if (SCHEDULE_ADMIN_IDS.includes(interaction.user.id)) {
+        const editButton = new ButtonBuilder()
+          .setCustomId('streams-edit-button')
+          .setLabel('✏️ Modifier le planning')
+          .setStyle(ButtonStyle.Secondary);
+
+        await interaction.followUp({
+          components: [new ActionRowBuilder().addComponents(editButton)],
+          ephemeral: true,
+        });
+      }
+      return;
+    }
+
+    if (interaction.isButton() && interaction.customId === 'streams-edit-button') {
+      if (!SCHEDULE_ADMIN_IDS.includes(interaction.user.id)) {
+        await interaction.reply({ content: "❌ Tu n'as pas la permission de modifier le planning.", ephemeral: true });
+        return;
+      }
+
+      const { weekly, dates } = loadStreamsPlanning();
+
+      const weeklyInput = new TextInputBuilder()
+        .setCustomId('weekly')
+        .setLabel('Chaque semaine (1 jour par ligne)')
+        .setPlaceholder('Lundi 18h00\nMercredi 20h00\nVendredi 18h00')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false);
+      if (weekly.length) weeklyInput.setValue(weekly.join('\n'));
+
+      const datesInput = new TextInputBuilder()
+        .setCustomId('dates')
+        .setLabel('Dates à venir (JJ/MM/AAAA HH:mm, 1/ligne)')
+        .setPlaceholder('20/07/2026 18:00')
+        .setStyle(TextInputStyle.Paragraph)
+        .setRequired(false);
+      if (dates.length) datesInput.setValue(dates.map(formatParisDateTime).join('\n'));
+
+      const modal = new ModalBuilder()
+        .setCustomId('streams-edit-modal')
+        .setTitle('Modifier le planning')
+        .addComponents(
+          new ActionRowBuilder().addComponents(weeklyInput),
+          new ActionRowBuilder().addComponents(datesInput),
+        );
+
+      await interaction.showModal(modal);
+      return;
+    }
+
+    if (interaction.isModalSubmit() && interaction.customId === 'streams-edit-modal') {
+      const weekly = interaction.fields
+        .getTextInputValue('weekly')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      const dateLines = interaction.fields
+        .getTextInputValue('dates')
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      const dates = [];
+      const invalidLines = [];
+      for (const line of dateLines) {
+        const ts = parseParisDateTime(line);
+        if (ts === null) invalidLines.push(line);
+        else dates.push(ts);
+      }
+
+      if (invalidLines.length) {
+        await interaction.reply({
+          content: `❌ Format invalide pour : ${invalidLines.map((l) => `\`${l}\``).join(', ')}\nUtilise JJ/MM/AAAA HH:mm, une date par ligne.`,
+          ephemeral: true,
+        });
+        return;
+      }
+
+      dates.sort((a, b) => a - b);
+      saveStreamsPlanning(weekly, dates);
+      await interaction.reply({ content: '✅ Planning mis à jour.', ephemeral: true });
+      return;
     }
   } catch (err) {
     console.error("❌ Erreur lors du traitement d'une interaction :", err.message);
